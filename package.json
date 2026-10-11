@@ -1,0 +1,16 @@
+{
+  "name": "pi-auto-compact",
+  "version": "0.1.0",
+  "description": "Automatic context compaction for pi at logical checkpoints (used by Convoy at phase boundaries, usable standalone)",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test 'test/*.test.ts'"
+  },
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  }
+}
