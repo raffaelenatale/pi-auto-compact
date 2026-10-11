@@ -20,6 +20,8 @@ pi install npm:@raffaelenatale/pi-auto-compact
 - `/auto-compact [instructions]` — compact now (explicit instructions force the compaction regardless of usage).
 - `/auto-compact status` — show enabled/threshold/current usage/instructions template.
 
+The model can also compact by itself through the `auto_compact` tool (`reason?`, `instructions?`, `force?`), with the same rules as `/auto-compact`: without instructions it is skipped below the threshold.
+
 Other extensions request a compaction at a logical point by emitting the custom pi event:
 
 ```ts

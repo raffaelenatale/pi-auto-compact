@@ -184,6 +184,33 @@ export default function autoCompactExtension(pi: ExtensionAPI): void {
 			}
 		},
 	});
+
+	// Model-callable: the agent can decide on its own to compact at a checkpoint.
+	pi.registerTool({
+		name: "auto_compact",
+		label: "Auto compact",
+		description:
+			"Compact the conversation context now, at a logical checkpoint (e.g. a finished phase). " +
+			"Pass `instructions` describing what must be kept verbatim; giving instructions forces the compaction. " +
+			"Without instructions it is skipped below the context-usage threshold.",
+		parameters: {
+			type: "object",
+			properties: {
+				reason: { type: "string", description: "Why this checkpoint is a good place to compact" },
+				instructions: { type: "string", description: "What to preserve in the summary (merged with the defaults)" },
+				force: { type: "boolean", description: "Compact even below the threshold" },
+			},
+			required: [],
+		},
+		async execute(_toolCallId: string, params: CompactRequest, _signal: unknown, _onUpdate: unknown, ctx: any) {
+			const outcome = handle({ reason: params?.reason, instructions: params?.instructions, force: params?.force, source: "tool" }, ctx);
+			const text =
+				outcome.status === "compacted"
+					? "Compaction started at the checkpoint."
+					: `Compaction not run: ${outcome.status}${outcome.detail ? ` (${outcome.detail})` : ""}.`;
+			return { content: [{ type: "text", text }], details: { status: outcome.status, detail: outcome.detail } };
+		},
+	});
 }
 
 export { autoCompactExtension };
