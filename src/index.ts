@@ -18,8 +18,10 @@
  * - `globalThis.__pi_auto_compact_request(payload, ctx)` — same request for
  *   code that cannot reach the event bus.
  *
- * Compaction runs through pi's native `ctx.compact({ customInstructions })`,
- * which aborts the current agent turn before summarizing.
+ * Compaction runs through pi's native `ctx.compact({ customInstructions })`.
+ * That call aborts any active agent run, so the tool never compacts mid-run:
+ * it schedules the compaction and runs it on `agent_settled`, when the agent is
+ * idle — the same clean state as the native /compact, with no abort error.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -106,7 +108,7 @@ export function compactPromptRequest(focus?: string): string {
 
 export const TOOL_GUIDELINES = [
 	"Use `auto_compact` when the user asks to compact, or at a real checkpoint (a task or phase is finished and the next work has a different focus) while context usage is high.",
-	"Never call `auto_compact` in the middle of unfinished work: compaction aborts the current turn, so make it the last action of the turn.",
+	"Call `auto_compact` only when the current work is done: the context is compacted right after this turn ends, so close the turn with a short final message and no further work.",
 	"In `instructions`, write the compaction prompt yourself: what the next work needs kept verbatim and what can be dropped. Set `force: true` only when the user asked for the compaction.",
 ];
 
@@ -116,6 +118,8 @@ export default function autoCompactExtension(pi: ExtensionAPI): void {
 		| undefined;
 	const config = configFromEnv(process.env);
 	let compacting = false;
+	/** Scheduled by the tool; started on agent_settled, when no run is active. */
+	let pending: { request: CompactRequest; instructions?: string } | null = null;
 
 	const announce = (payload: { status: string; reason?: string; detail?: string }) => {
 		try {
@@ -123,14 +127,30 @@ export default function autoCompactExtension(pi: ExtensionAPI): void {
 		} catch {}
 	};
 
-	const handle = (request: CompactRequest, ctx: any): { status: "started" | "skip" | "busy" | "error"; detail?: string } => {
+	type Outcome = { status: "started" | "scheduled" | "skip" | "busy" | "error"; detail?: string };
+
+	/** Runs the guards, then compacts now or (deferred) schedules it for agent_settled. */
+	const handle = (request: CompactRequest, ctx: any, deferred = false): Outcome => {
 		const usage = typeof ctx?.getContextUsage === "function" ? ctx.getContextUsage() : undefined;
 		const percent = typeof usage?.percent === "number" ? usage.percent : null;
-		const decision = decide(request, config, percent, compacting);
+		const decision = decide(request, config, percent, compacting || pending !== null);
 		if (decision.action !== "compact") {
 			announce({ status: decision.action === "busy" ? "busy" : "skipped", reason: request.reason, detail: decision.detail });
 			return { status: decision.action, detail: decision.detail };
 		}
+		if (typeof ctx?.compact !== "function") {
+			const detail = "context has no compact() — not running inside a pi session";
+			announce({ status: "error", reason: request.reason, detail });
+			return { status: "error", detail };
+		}
+		if (deferred) {
+			pending = { request, instructions: decision.instructions };
+			return { status: "scheduled" };
+		}
+		return start(request, decision.instructions, ctx);
+	};
+
+	const start = (request: CompactRequest, instructions: string | undefined, ctx: any): Outcome => {
 		if (typeof ctx?.compact !== "function") {
 			const detail = "context has no compact() — not running inside a pi session";
 			announce({ status: "error", reason: request.reason, detail });
@@ -147,7 +167,7 @@ export default function autoCompactExtension(pi: ExtensionAPI): void {
 		compacting = true;
 		try {
 			ctx.compact({
-				customInstructions: decision.instructions,
+				customInstructions: instructions,
 				onComplete: () => {
 					compacting = false;
 					announce({ status: "compacted", reason: request.reason });
@@ -161,6 +181,13 @@ export default function autoCompactExtension(pi: ExtensionAPI): void {
 	};
 
 	events?.on(REQUEST_EVENT, (data: any, ctx: any) => handle(data ?? {}, ctx));
+	// The agent is idle here: compacting cannot abort a run.
+	(pi as any).on?.("agent_settled", (_event: unknown, ctx: any) => {
+		if (!pending) return;
+		const { request, instructions } = pending;
+		pending = null;
+		start(request, instructions, ctx);
+	});
 	(globalThis as any).__pi_auto_compact_request = (payload: CompactRequest, ctx?: any) => handle(payload ?? {}, ctx ?? null);
 
 	pi.registerCommand("auto-compact", {
@@ -188,7 +215,7 @@ export default function autoCompactExtension(pi: ExtensionAPI): void {
 		label: "Auto compact",
 		description:
 			"Compact the conversation context at a logical checkpoint, keeping what `instructions` says the next work needs. " +
-			"Compaction aborts the current turn, so call it last. Skipped below the context-usage threshold unless `force` is true.",
+			"The compaction runs right after the current turn ends. Skipped below the context-usage threshold unless `force` is true.",
 		promptSnippet: "auto_compact: compact the context at a logical checkpoint with focused instructions",
 		promptGuidelines: TOOL_GUIDELINES,
 		parameters: {
@@ -203,14 +230,16 @@ export default function autoCompactExtension(pi: ExtensionAPI): void {
 		async execute(_toolCallId: string, params: CompactRequest, _signal: unknown, _onUpdate: unknown, ctx: any) {
 			// Unlike the event API, instructions do not imply force here: the model almost
 			// always passes instructions, and that must not bypass the threshold.
+			// Deferred: ctx.compact() would abort this very run.
 			const outcome = handle(
 				{ reason: params?.reason, instructions: params?.instructions, force: params?.force === true, source: "tool" },
 				ctx,
+				true,
 			);
 			const text =
-				outcome.status === "started"
-					? "Compaction started; the current turn ends now."
-					: `Compaction not run: ${outcome.status}${outcome.detail ? ` (${outcome.detail})` : ""}.`;
+				outcome.status === "scheduled"
+					? "Compaction scheduled: it runs right after this turn ends. Reply with a short closing message and do no further work."
+					: `Compaction not scheduled: ${outcome.status}${outcome.detail ? ` (${outcome.detail})` : ""}.`;
 			return { content: [{ type: "text", text }], details: { status: outcome.status, detail: outcome.detail } };
 		},
 	});

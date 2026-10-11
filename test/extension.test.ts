@@ -7,6 +7,7 @@ function setup(usagePercent: number | null = 80) {
 	const commands: Record<string, any> = {};
 	const tools: Record<string, any> = {};
 	const handlers: Record<string, (data: any, ctx?: any) => any> = {};
+	const piHandlers: Record<string, (event: any, ctx?: any) => any> = {};
 	const sent: Array<[string, any]> = [];
 	const emitted: Array<[string, any]> = [];
 	const compactions: any[] = [];
@@ -15,6 +16,7 @@ function setup(usagePercent: number | null = 80) {
 		registerCommand: (name: string, options: any) => (commands[name] = options),
 		registerTool: (tool: any) => (tools[tool.name] = tool),
 		sendUserMessage: (text: string, options: any) => sent.push([text, options]),
+		on: (name: string, handler: any) => (piHandlers[name] = handler),
 		events: {
 			on: (name: string, handler: any) => (handlers[name] = handler),
 			emit: (name: string, data: any) => emitted.push([name, data]),
@@ -27,7 +29,8 @@ function setup(usagePercent: number | null = 80) {
 		compact: (options: any) => compactions.push(options),
 	};
 	autoCompactExtension(pi as any);
-	return { commands, tools, handlers, sent, emitted, compactions, notices, ctx };
+	const settle = () => piHandlers.agent_settled?.({ type: "agent_settled", aborted: false }, ctx);
+	return { commands, tools, handlers, sent, emitted, compactions, notices, ctx, settle };
 }
 
 test("/auto-compact <focus> asks the agent to write the prompt and call the tool", async () => {
@@ -66,40 +69,56 @@ test("tool: requires instructions and ships prompt guidelines", () => {
 	assert.ok(tool.promptSnippet);
 });
 
-test("tool: passes the agent's prompt verbatim to pi's compaction", async () => {
+test("tool: schedules the agent's prompt and compacts only when the agent settles", async () => {
 	const s = setup(80);
 	const result = await s.tools.auto_compact.execute("id", { instructions: "keep the task list" }, null, null, s.ctx);
-	assert.equal(result.details.status, "started");
+	assert.equal(result.details.status, "scheduled");
+	assert.equal(s.compactions.length, 0, "no compaction mid-run: it would abort the turn");
+	s.settle();
+	assert.equal(s.compactions.length, 1);
 	assert.equal(s.compactions[0].customInstructions, "keep the task list");
+	s.settle();
+	assert.equal(s.compactions.length, 1, "a schedule runs once");
 });
 
-test("tool: below threshold without force does not compact", async () => {
-	const s = setup(20);
-	const result = await s.tools.auto_compact.execute("id", { instructions: "keep the task list" }, null, null, s.ctx);
-	assert.equal(result.details.status, "skip");
+test("agent_settled without a scheduled compaction does nothing", () => {
+	const s = setup(80);
+	s.settle();
 	assert.equal(s.compactions.length, 0);
 });
 
-test("tool: force compacts below threshold", async () => {
+test("tool: below threshold without force does not schedule", async () => {
 	const s = setup(20);
-	const result = await s.tools.auto_compact.execute("id", { instructions: "keep it", force: true }, null, null, s.ctx);
-	assert.equal(result.details.status, "started");
+	const result = await s.tools.auto_compact.execute("id", { instructions: "keep the task list" }, null, null, s.ctx);
+	assert.equal(result.details.status, "skip");
+	s.settle();
+	assert.equal(s.compactions.length, 0);
 });
 
-test("tool: a second request while compacting is busy; completion frees it", async () => {
+test("tool: force schedules below threshold", async () => {
+	const s = setup(20);
+	const result = await s.tools.auto_compact.execute("id", { instructions: "keep it", force: true }, null, null, s.ctx);
+	assert.equal(result.details.status, "scheduled");
+});
+
+test("tool: busy while scheduled or compacting; completion frees it", async () => {
 	const s = setup(80);
 	await s.tools.auto_compact.execute("id", { instructions: "a" }, null, null, s.ctx);
-	const second = await s.tools.auto_compact.execute("id", { instructions: "b" }, null, null, s.ctx);
-	assert.equal(second.details.status, "busy");
+	const whileScheduled = await s.tools.auto_compact.execute("id", { instructions: "b" }, null, null, s.ctx);
+	assert.equal(whileScheduled.details.status, "busy");
+	s.settle();
+	const whileCompacting = await s.tools.auto_compact.execute("id", { instructions: "c" }, null, null, s.ctx);
+	assert.equal(whileCompacting.details.status, "busy");
 	s.compactions[0].onComplete();
 	assert.deepEqual(s.emitted.at(-1), [RESULT_EVENT, { status: "compacted", reason: undefined }]);
-	const third = await s.tools.auto_compact.execute("id", { instructions: "c" }, null, null, s.ctx);
-	assert.equal(third.details.status, "started");
+	const after = await s.tools.auto_compact.execute("id", { instructions: "d" }, null, null, s.ctx);
+	assert.equal(after.details.status, "scheduled");
 });
 
 test("late compaction errors are announced and shown to the user", async () => {
 	const s = setup(80);
 	await s.tools.auto_compact.execute("id", { instructions: "a", reason: "phase done" }, null, null, s.ctx);
+	s.settle();
 	s.compactions[0].onError(new Error("Nothing to compact"));
 	assert.deepEqual(s.emitted.at(-1), [RESULT_EVENT, { status: "error", reason: "phase done", detail: "Nothing to compact" }]);
 	assert.match(s.notices.at(-1)!, /Nothing to compact/);
