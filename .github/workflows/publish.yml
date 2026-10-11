@@ -1,7 +1,7 @@
 name: Publish
 
-# Pubblica su GitHub Packages (npm.pkg.github.com) quando si crea una release
-# oppure si lancia a mano. Richiede solo il GITHUB_TOKEN del workflow.
+# Publishes to GitHub Packages (npm.pkg.github.com) when a release is published.
+# The release tag must match the package.json version (vX.Y.Z).
 on:
   release:
     types: [published]
@@ -16,7 +16,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -24,6 +23,14 @@ jobs:
           node-version: 22
           registry-url: https://npm.pkg.github.com
           scope: "@raffaelenatale"
+      - name: Check tag matches package version
+        if: github.event_name == 'release'
+        run: |
+          expected="v$(node -p 'require("./package.json").version')"
+          if [ "$GITHUB_REF_NAME" != "$expected" ]; then
+            echo "Release tag $GITHUB_REF_NAME does not match package version $expected" >&2
+            exit 1
+          fi
       - run: npm test
       - run: npm publish
         env:

@@ -1,6 +1,20 @@
 {
   "name": "@raffaelenatale/pi-auto-compact",
-  "version": "0.3.0",
+  "version": "0.4.0",
+  "description": "Agent-written context compaction for pi at logical checkpoints",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "compaction",
+    "context"
+  ],
+  "author": "Raffaele Natale",
+  "license": "MIT",
+  "homepage": "https://github.com/raffaelenatale/pi-auto-compact#readme",
+  "bugs": {
+    "url": "https://github.com/raffaelenatale/pi-auto-compact/issues"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/raffaelenatale/pi-auto-compact.git"
@@ -9,20 +23,25 @@
     "registry": "https://npm.pkg.github.com",
     "access": "restricted"
   },
+  "type": "module",
   "files": [
     "src",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
   ],
-  "description": "Automatic context compaction for pi at logical checkpoints (used by Convoy at phase boundaries, usable standalone)",
-  "license": "MIT",
-  "type": "module",
   "engines": {
     "node": ">=22"
   },
   "scripts": {
     "test": "node --test 'test/*.test.ts'"
   },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
   "pi": {
-    "extensions": ["./src/index.ts"]
+    "extensions": [
+      "./src/index.ts"
+    ]
   }
 }

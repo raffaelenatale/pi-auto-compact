@@ -1,55 +1,79 @@
 # pi-auto-compact
 
-Automatic context compaction for [pi](https://github.com/earendil-works/pi) at **logical checkpoints** — not only when the context overflows. Born from Convoy's need to compact Alpha's context between phases; usable by any long session with milestone boundaries.
+[![CI](https://github.com/raffaelenatale/pi-auto-compact/actions/workflows/ci.yml/badge.svg)](https://github.com/raffaelenatale/pi-auto-compact/actions/workflows/ci.yml)
+[![Publish](https://github.com/raffaelenatale/pi-auto-compact/actions/workflows/publish.yml/badge.svg)](https://github.com/raffaelenatale/pi-auto-compact/actions/workflows/publish.yml)
+
+Context compaction for [pi](https://github.com/earendil-works/pi) at **logical checkpoints**, with the compaction prompt written by the agent instead of a fixed template.
+
+## Why
+
+pi compacts automatically when the context is close to full, and `/compact` summarizes on demand. Long sessions have better moments to compact: a task is closed, a phase is finished, the work is about to change focus. Compacting there works better — but only if the summary keeps what the *next* work needs. What that is, the agent knows better than any fixed template, so this extension always delegates the prompt to the agent's judgment and never merges in canned instructions.
+
+## What you get
+
+| Entry point | What it does |
+| --- | --- |
+| `/auto-compact [focus]` | Sends a request to the agent: write a compaction prompt for this focus (default: *continue working on the most recent work*) and run it through the `auto_compact` tool. |
+| `/auto-compact status` | Shows whether the extension is enabled, the threshold and the current context usage. |
+| `auto_compact` tool | The model compacts on its own at a checkpoint — no user command needed. `instructions` (the prompt it wrote) is required. |
+| `auto-compact:request` event | Other extensions request a compaction: `{ reason?, instructions?, force? }`. Without `instructions`, pi's native summary prompt is used. |
+| `auto-compact:result` event | Outcomes: `compacted \| skipped \| busy \| error`, with `reason` and `detail`. |
+| `globalThis.__pi_auto_compact_request(payload, ctx)` | Same request, for code that cannot reach the event bus. |
+
+Compaction runs through pi's native `ctx.compact({ customInstructions })`, which **aborts the current agent turn** before summarizing. The `auto_compact` tool says so and must be the last action of a turn — this is also in the tool's prompt guidelines, so the model knows it without any skill.
+
+## Guards
+
+- **Threshold**: unforced requests are skipped below the context-usage threshold (`PI_AUTO_COMPACT_THRESHOLD`, default `60`%). A forced request or one with explicit `instructions` coming from the event API bypasses it; the `auto_compact` tool bypasses it only with `force: true`, so the model cannot over-compact on its own.
+- **In flight**: while a compaction is running, further requests return `busy` without retry.
+- **Disable**: `PI_AUTO_COMPACT=0` (or `false`) skips every request.
+- **No context**: outside a real pi session the request returns `error` instead of pretending success.
 
 ## Install
 
-Pubblicato su GitHub Packages (`@raffaelenatale/pi-auto-compact`). Serve un `~/.npmrc` che mappa lo scope sul registry GitHub con un token con scope `read:packages`:
+Published on GitHub Packages. You need a `~/.npmrc` that maps the scope to the GitHub registry with a token that has `read:packages` (any token works for packages of public repos; for private ones, the token's account must have access):
 
 ```ini
 @raffaelenatale:registry=https://npm.pkg.github.com
-//npm.pkg.github.com/:_authToken=<token con read:packages>
+//npm.pkg.github.com/:_authToken=<token>
 ```
+
+Then:
 
 ```sh
 pi install npm:@raffaelenatale/pi-auto-compact
 ```
 
-## Usage
+After a release you can update with the same command (or `pi update`, if you installed without pinning a version). Reload pi (or restart the session) to load a newly installed version.
 
-- `/auto-compact <focus>` — describe what the next work is about (e.g. `/auto-compact lavoriamo sulla task 3, fix bug visualizzazione dati`). The agent writes a compaction prompt for that focus and runs it through the `auto_compact` tool. The compaction is forced.
-- `/auto-compact` (no args) — compact now with the default instructions.
-- `/auto-compact status` — show enabled/threshold/current usage/instructions template.
+## Integration example
 
-The model can also compact by itself through the `auto_compact` tool (`reason?`, `instructions?`, `force?`), with the same rules as `/auto-compact`: without instructions it is skipped below the threshold.
-
-Other extensions request a compaction at a logical point by emitting the custom pi event:
+Another extension can compact at its own logical boundaries:
 
 ```ts
 pi.events.emit("auto-compact:request", {
-  reason: "phase-2 closed",
-  instructions: "Keep the run contract and the phase findings table",
+  reason: "phase 2 closed",
+  instructions: "Keep the run contract and the phase findings table", // optional
   force: false,
 });
+
+pi.events.on("auto-compact:result", (r) => console.log(r.status, r.reason, r.detail));
 ```
 
-Results come back on `auto-compact:result` (`compacted | skipped | busy | error`, with `detail`). Tool code can also call `globalThis.__pi_auto_compact_request(payload, ctx)`.
+## Development
 
-## Configuration
+```sh
+git clone https://github.com/raffaelenatale/pi-auto-compact.git
+cd pi-auto-compact
+npm test          # node:test, no dependencies
+```
 
-| Env | Default | Meaning |
-| --- | --- | --- |
-| `PI_AUTO_COMPACT` | `1` | `0`/`false` disables requests |
-| `PI_AUTO_COMPACT_THRESHOLD` | `60` | minimum context usage (%) for unforced requests |
+- `src/index.ts` — the extension (single file, no runtime dependencies; `@earendil-works/pi-coding-agent` is host-provided and declared as a peer).
+- `test/` — unit tests for the decision logic and the command/tool/event surfaces with a fake pi.
+- CI runs the tests on Node 22 and 24; publishing to GitHub Packages happens on each [release](CHANGELOG.md), with a tag/version check.
 
-Unforced requests (no explicit instructions, no `force`) are skipped below the threshold — a fresh session does not get compacted at every checkpoint. A compaction already in flight answers `busy` without retrying.
-
-The default instructions preserve: contract/plan and frozen decisions; run/checkpoint state and next steps; open human questions and answers; evidence paths and head commits.
-
-## Convoy integration
-
-The `convoy-pi` extension emits `auto-compact:request` when a bound run's phase changes (green + discussed), with instructions to keep contract, state and decisions. This extension is optional: without it Convoy simply does not compact at phase boundaries.
+Releasing: update `CHANGELOG.md`, bump `version` in `package.json`, push, then create a release tagged `v<version>` — the Publish workflow tests and publishes.
 
 ## License
 
-MIT
+[MIT](LICENSE)
