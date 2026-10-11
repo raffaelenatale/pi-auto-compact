@@ -124,9 +124,14 @@ export default function autoCompactExtension(pi: ExtensionAPI): void {
 			result({ status: decision.action === "busy" ? "busy" : "skipped", reason: request?.reason, detail: decision.detail });
 			return { status: decision.action, detail: decision.detail };
 		}
+		if (typeof ctx?.compact !== "function") {
+			const detail = "context has no compact() — not running inside an interactive pi session";
+			result({ status: "error", reason: request?.reason, detail });
+			return { status: "error", detail };
+		}
 		compacting = true;
 		try {
-			ctx.compact?.({
+			ctx.compact({
 				customInstructions: decision.instructions,
 				onComplete: () => {
 					compacting = false;
@@ -166,7 +171,7 @@ export default function autoCompactExtension(pi: ExtensionAPI): void {
 				return;
 			}
 			const outcome = handle(
-				{ reason: arg ? "slash-command" : "slash-command", instructions: arg || undefined, force: true, source: "user" },
+				{ reason: "slash-command", instructions: arg || undefined, force: true, source: "user" },
 				ctx,
 			);
 			if (ctx?.hasUI) {

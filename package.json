@@ -1,6 +1,18 @@
 {
-  "name": "pi-auto-compact",
+  "name": "@raffaelenatale/pi-auto-compact",
   "version": "0.1.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/raffaelenatale/pi-auto-compact.git"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com",
+    "access": "restricted"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
   "description": "Automatic context compaction for pi at logical checkpoints (used by Convoy at phase boundaries, usable standalone)",
   "license": "MIT",
   "type": "module",

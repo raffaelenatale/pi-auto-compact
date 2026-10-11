@@ -4,8 +4,15 @@ Automatic context compaction for [pi](https://github.com/earendil-works/pi) at *
 
 ## Install
 
+Pubblicato su GitHub Packages (`@raffaelenatale/pi-auto-compact`). Serve un `~/.npmrc` che mappa lo scope sul registry GitHub con un token con scope `read:packages`:
+
+```ini
+@raffaelenatale:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=<token con read:packages>
+```
+
 ```sh
-pi install npm:pi-auto-compact   # or: pi install /path/to/pi-auto-compact
+pi install npm:@raffaelenatale/pi-auto-compact
 ```
 
 ## Usage
