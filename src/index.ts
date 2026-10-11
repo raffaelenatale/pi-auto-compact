@@ -99,6 +99,16 @@ export function mergeConfig(base: AutoCompactConfig, overrides: Partial<AutoComp
 	return merged;
 }
 
+/** Message sent to the agent by `/auto-compact <focus>`. */
+export function compactPromptRequest(focus: string): string {
+	return [
+		`Compact your context now, for this focus: "${focus.trim()}".`,
+		"1. Write a compaction prompt in the language of this conversation: state what to keep verbatim for this focus (decisions, contract, current state, next steps, open questions, file paths, commits) and what to drop.",
+		"2. Call the `auto_compact` tool with `force: true` and `instructions` set to that prompt.",
+		"Do not do any other work in this turn.",
+	].join("\n");
+}
+
 export default function autoCompactExtension(pi: ExtensionAPI): void {
 	const events = (pi as any).events as
 		| { on(name: string, handler: (data: any, ctx?: any) => void): any; emit(name: string, data: unknown): void }
@@ -156,7 +166,7 @@ export default function autoCompactExtension(pi: ExtensionAPI): void {
 		handle(payload ?? {}, ctx ?? null);
 
 	pi.registerCommand("auto-compact", {
-		description: "Compact context now, or show auto-compact status (`/auto-compact status`)",
+		description: "Compact for a focus you describe (`/auto-compact <focus>`), compact with defaults (no args), or `/auto-compact status`",
 		handler: async (rawArgs: unknown, ctx: any) => {
 			const arg = String(rawArgs ?? "").trim();
 			if (arg === "status") {
@@ -170,10 +180,14 @@ export default function autoCompactExtension(pi: ExtensionAPI): void {
 				ctx?.ui?.notify?.(lines.join("\n"), "info");
 				return;
 			}
-			const outcome = handle(
-				{ reason: "slash-command", instructions: arg || undefined, force: true, source: "user" },
-				ctx,
-			);
+			if (arg) {
+				// The argument describes what the next work is about: the agent writes the
+				// compaction prompt itself and runs it through the auto_compact tool.
+				pi.sendUserMessage(compactPromptRequest(arg), { deliverAs: "followUp" });
+				ctx?.ui?.notify?.("auto-compact: the agent is writing the compaction prompt", "info");
+				return;
+			}
+			const outcome = handle({ reason: "slash-command", force: true, source: "user" }, ctx);
 			if (ctx?.hasUI) {
 				ctx.ui.notify?.(
 					outcome.status === "compacted"

@@ -17,7 +17,8 @@ pi install npm:@raffaelenatale/pi-auto-compact
 
 ## Usage
 
-- `/auto-compact [instructions]` — compact now (explicit instructions force the compaction regardless of usage).
+- `/auto-compact <focus>` — describe what the next work is about (e.g. `/auto-compact lavoriamo sulla task 3, fix bug visualizzazione dati`). The agent writes a compaction prompt for that focus and runs it through the `auto_compact` tool. The compaction is forced.
+- `/auto-compact` (no args) — compact now with the default instructions.
 - `/auto-compact status` — show enabled/threshold/current usage/instructions template.
 
 The model can also compact by itself through the `auto_compact` tool (`reason?`, `instructions?`, `force?`), with the same rules as `/auto-compact`: without instructions it is skipped below the threshold.
