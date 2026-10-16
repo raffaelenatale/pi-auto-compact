@@ -13,31 +13,54 @@
  * - `/auto-compact status` — show configuration and current usage.
  * - Tool `auto_compact` — the model compacts on its own at a checkpoint.
  * - Event `auto-compact:request` — other extensions (e.g. Convoy) request a
- *   compaction: `{ reason?, instructions?, force? }`. Outcomes are emitted on
- *   `auto-compact:result`.
+ *   compaction: `{ reason?, instructions?, force?, resume? }`. With `resume`,
+ *   the agent restarts on that message after compacting, without the user.
+ *   Outcomes are emitted on `auto-compact:result`.
  * - `globalThis.__pi_auto_compact_request(payload, ctx)` — same request for
  *   code that cannot reach the event bus.
  *
  * Compaction runs through pi's native `ctx.compact({ customInstructions })`.
- * That call aborts any active agent run, so the tool never compacts mid-run:
- * it schedules the compaction and runs it on `agent_settled`, when the agent is
- * idle — the same clean state as the native /compact, with no abort error.
+ * That call aborts any active agent run, so nothing compacts mid-run: the tool,
+ * and any request arriving while the agent is busy, is scheduled and runs on
+ * `agent_settled`, when the agent is idle — the same clean state as the native
+ * /compact, with no abort error.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export const REQUEST_EVENT = "auto-compact:request";
 export const RESULT_EVENT = "auto-compact:result";
+/** Automatic resumes allowed without user input in between (loop guard). */
+export const MAX_AUTO_RESUMES = 3;
+
+/** Thinking levels from lowest to highest. */
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type ThinkingSetting = (typeof THINKING_LEVELS)[number];
 
 export interface AutoCompactConfig {
 	enabled: boolean;
 	/** Unforced requests compact only at or above this context usage (%). */
 	thresholdPercent: number;
+	/**
+	 * Thinking level cap while compacting, or `null` to keep the session's level.
+	 * pi gives the summary a small output budget and thinking counts against it:
+	 * at high levels the summary is truncated ("generation hit the token cap").
+	 */
+	compactThinking: ThinkingSetting | null;
 }
 
 export const DEFAULT_CONFIG: AutoCompactConfig = {
 	enabled: true,
 	thresholdPercent: 60,
+	compactThinking: "low",
 };
+
+/** The level to use while compacting: the cap if the current level is above it, else `null` (no change). */
+export function thinkingForCompaction(current: string | undefined, cap: ThinkingSetting | null): ThinkingSetting | null {
+	if (!cap || !current) return null;
+	const have = THINKING_LEVELS.indexOf(current as ThinkingSetting);
+	const want = THINKING_LEVELS.indexOf(cap);
+	return have > want && want >= 0 ? cap : null;
+}
 
 export interface CompactRequest {
 	reason?: string;
@@ -45,6 +68,8 @@ export interface CompactRequest {
 	instructions?: string;
 	/** Bypass the threshold. When omitted, non-empty `instructions` imply `force`. */
 	force?: boolean;
+	/** Sent to the agent after a successful compaction, starting a new turn, so work continues without the user. */
+	resume?: string;
 	source?: string;
 }
 
@@ -81,13 +106,18 @@ export function mergeConfig(base: AutoCompactConfig, overrides: Partial<AutoComp
 	if (typeof overrides.thresholdPercent === "number" && Number.isFinite(overrides.thresholdPercent)) {
 		merged.thresholdPercent = Math.min(100, Math.max(0, overrides.thresholdPercent));
 	}
+	if (overrides.compactThinking === null || THINKING_LEVELS.includes(overrides.compactThinking as ThinkingSetting)) {
+		merged.compactThinking = overrides.compactThinking;
+	}
 	return merged;
 }
 
-/** Reads `PI_AUTO_COMPACT` and `PI_AUTO_COMPACT_THRESHOLD`. */
+/** Reads `PI_AUTO_COMPACT`, `PI_AUTO_COMPACT_THRESHOLD` and `PI_AUTO_COMPACT_THINKING` (a level, or `keep`). */
 export function configFromEnv(env: Record<string, string | undefined>): AutoCompactConfig {
 	const flag = env.PI_AUTO_COMPACT?.trim().toLowerCase();
+	const thinking = env.PI_AUTO_COMPACT_THINKING?.trim().toLowerCase();
 	return mergeConfig(DEFAULT_CONFIG, {
+		compactThinking: thinking === "keep" ? null : (thinking as ThinkingSetting | undefined),
 		enabled: flag === "0" || flag === "false" ? false : undefined,
 		thresholdPercent: env.PI_AUTO_COMPACT_THRESHOLD ? Number(env.PI_AUTO_COMPACT_THRESHOLD) : undefined,
 	});
@@ -108,20 +138,31 @@ export function compactPromptRequest(focus?: string): string {
 
 export const TOOL_GUIDELINES = [
 	"Use `auto_compact` when the user asks to compact, or at a real checkpoint (a task or phase is finished and the next work has a different focus) while context usage is high.",
-	"Call `auto_compact` only when the current work is done: the context is compacted right after this turn ends, so close the turn with a short final message and no further work.",
+	"Make `auto_compact` the last action of the turn: the context is compacted right after this turn ends, so close the turn with a short final message and no further work.",
 	"In `instructions`, write the compaction prompt yourself: what the next work needs kept verbatim and what can be dropped. Set `force: true` only when the user asked for the compaction.",
+	"When you compact on your own in the middle of a longer task, set `resume` to the message that restarts the work (the next step): the agent then continues after the compaction without waiting for the user.",
 ];
 
 export default function autoCompactExtension(pi: ExtensionAPI): void {
 	const events = (pi as any).events as
-		| { on(name: string, handler: (data: any, ctx?: any) => void): any; emit(name: string, data: unknown): void }
+		| { on(name: string, handler: (data: any) => void): any; emit(name: string, data: unknown): void }
 		| undefined;
 	const config = configFromEnv(process.env);
 	let compacting = false;
-	/** Scheduled by the tool; started on agent_settled, when no run is active. */
+	/** Scheduled request; started on agent_settled, when no run is active. */
 	let pending: { request: CompactRequest; instructions?: string } | null = null;
+	/** Automatic resumes since the last user input (loop guard). */
+	let resumes = 0;
+	/**
+	 * pi's event bus passes only the payload, never a context: keep the latest
+	 * context seen by lifecycle handlers for requests coming from other extensions.
+	 */
+	let lastCtx: any = null;
+	const remember = (ctx: any) => {
+		if (ctx && typeof ctx === "object") lastCtx = ctx;
+	};
 
-	const announce = (payload: { status: string; reason?: string; detail?: string }) => {
+	const announce = (payload: { status: string; reason?: string; detail?: string; resumed?: boolean }) => {
 		try {
 			events?.emit(RESULT_EVENT, payload);
 		} catch {}
@@ -129,7 +170,11 @@ export default function autoCompactExtension(pi: ExtensionAPI): void {
 
 	type Outcome = { status: "started" | "scheduled" | "skip" | "busy" | "error"; detail?: string };
 
-	/** Runs the guards, then compacts now or (deferred) schedules it for agent_settled. */
+	/**
+	 * Runs the guards, then compacts now or schedules it for agent_settled.
+	 * It defers when asked to (the tool, always mid-run) or when the agent is
+	 * busy: ctx.compact() would abort the active run.
+	 */
 	const handle = (request: CompactRequest, ctx: any, deferred = false): Outcome => {
 		const usage = typeof ctx?.getContextUsage === "function" ? ctx.getContextUsage() : undefined;
 		const percent = typeof usage?.percent === "number" ? usage.percent : null;
@@ -139,20 +184,55 @@ export default function autoCompactExtension(pi: ExtensionAPI): void {
 			return { status: decision.action, detail: decision.detail };
 		}
 		if (typeof ctx?.compact !== "function") {
-			const detail = "context has no compact() — not running inside a pi session";
+			const detail = "no pi context with compact() available";
 			announce({ status: "error", reason: request.reason, detail });
 			return { status: "error", detail };
 		}
-		if (deferred) {
+		const busy = typeof ctx.isIdle === "function" && !ctx.isIdle();
+		if (deferred || busy) {
 			pending = { request, instructions: decision.instructions };
+			announce({ status: "scheduled", reason: request.reason });
 			return { status: "scheduled" };
 		}
 		return start(request, decision.instructions, ctx);
 	};
 
+	/** After a successful compaction, restart the agent with `resume` (bounded). */
+	const resume = (request: CompactRequest, ctx: any): { resumed?: boolean; detail?: string } => {
+		const text = request.resume?.trim();
+		if (!text) return {};
+		if (resumes >= MAX_AUTO_RESUMES) {
+			const detail = `resume skipped: ${MAX_AUTO_RESUMES} automatic resumes without user input`;
+			if (ctx?.hasUI) ctx.ui?.notify?.(`auto-compact: ${detail}`, "warning");
+			return { resumed: false, detail };
+		}
+		resumes++;
+		pi.sendMessage({ customType: "auto-compact", content: text, display: true }, { triggerTurn: true });
+		return { resumed: true };
+	};
+
+	/** Caps the session's thinking level for the summary. Returns a function that restores it. */
+	const lowerThinking = (): (() => void) => {
+		try {
+			const previous = (pi as any).getThinkingLevel?.() as string | undefined;
+			const target = thinkingForCompaction(previous, config.compactThinking);
+			if (!target || typeof (pi as any).setThinkingLevel !== "function") return () => {};
+			(pi as any).setThinkingLevel(target);
+			// The model may clamp the level: restore only if it is still what we set.
+			const applied = (pi as any).getThinkingLevel?.() as string | undefined;
+			return () => {
+				try {
+					if ((pi as any).getThinkingLevel?.() === applied) (pi as any).setThinkingLevel(previous);
+				} catch {}
+			};
+		} catch {
+			return () => {};
+		}
+	};
+
 	const start = (request: CompactRequest, instructions: string | undefined, ctx: any): Outcome => {
 		if (typeof ctx?.compact !== "function") {
-			const detail = "context has no compact() — not running inside a pi session";
+			const detail = "no pi context with compact() available";
 			announce({ status: "error", reason: request.reason, detail });
 			return { status: "error", detail };
 		}
@@ -160,45 +240,63 @@ export default function autoCompactExtension(pi: ExtensionAPI): void {
 			compacting = false;
 			const detail = String((error as Error)?.message ?? error);
 			announce({ status: "error", reason: request.reason, detail });
-			// The caller has already returned "started": surface late failures to the user.
+			// The caller has already returned: surface late failures to the user.
 			if (ctx?.hasUI) ctx.ui?.notify?.(`auto-compact: compaction failed (${detail})`, "warning");
 			return detail;
 		};
 		compacting = true;
+		// Lower the thinking level for the summary, restore it when done.
+		const restoreThinking = lowerThinking();
+		const failAndRestore = (error: unknown) => {
+			restoreThinking();
+			return fail(error);
+		};
 		try {
 			ctx.compact({
 				customInstructions: instructions,
 				onComplete: () => {
+					restoreThinking();
 					compacting = false;
-					announce({ status: "compacted", reason: request.reason });
+					announce({ status: "compacted", reason: request.reason, ...resume(request, ctx) });
 				},
-				onError: fail,
+				onError: failAndRestore,
 			});
 		} catch (error) {
-			return { status: "error", detail: fail(error) };
+			return { status: "error", detail: failAndRestore(error) };
 		}
 		return { status: "started" };
 	};
 
-	events?.on(REQUEST_EVENT, (data: any, ctx: any) => handle(data ?? {}, ctx));
+	const on = (pi as any).on?.bind(pi) as ((name: string, handler: (event: any, ctx: any) => unknown) => unknown) | undefined;
+	for (const name of ["session_start", "agent_start", "turn_start", "turn_end"]) on?.(name, (_event, ctx) => remember(ctx));
+	// A real user message re-arms the automatic resumes.
+	on?.("input", (event, ctx) => {
+		remember(ctx);
+		if (event?.source !== "extension") resumes = 0;
+	});
 	// The agent is idle here: compacting cannot abort a run.
-	(pi as any).on?.("agent_settled", (_event: unknown, ctx: any) => {
+	on?.("agent_settled", (_event, ctx) => {
+		remember(ctx);
 		if (!pending) return;
 		const { request, instructions } = pending;
 		pending = null;
 		start(request, instructions, ctx);
 	});
-	(globalThis as any).__pi_auto_compact_request = (payload: CompactRequest, ctx?: any) => handle(payload ?? {}, ctx ?? null);
+
+	events?.on(REQUEST_EVENT, (data: any) => handle(data ?? {}, lastCtx));
+	(globalThis as any).__pi_auto_compact_request = (payload: CompactRequest, ctx?: any) => handle(payload ?? {}, ctx ?? lastCtx);
 
 	pi.registerCommand("auto-compact", {
 		description: "Have the agent write a compaction prompt and compact (`/auto-compact [focus]`), or `/auto-compact status`",
 		handler: async (rawArgs: unknown, ctx: any) => {
+			remember(ctx);
 			const arg = String(rawArgs ?? "").trim();
 			if (arg === "status") {
 				const usage = ctx?.getContextUsage?.();
 				const lines = [
 					`auto-compact: ${config.enabled ? "enabled" : "disabled"}`,
 					`threshold for the model's own compactions: ${config.thresholdPercent}% (current: ${usage?.percent ?? "?"}%)`,
+					`thinking while compacting: ${config.compactThinking ?? "unchanged"}`,
 				];
 				ctx?.ui?.notify?.(lines.join("\n"), "info");
 				return;
@@ -215,7 +313,8 @@ export default function autoCompactExtension(pi: ExtensionAPI): void {
 		label: "Auto compact",
 		description:
 			"Compact the conversation context at a logical checkpoint, keeping what `instructions` says the next work needs. " +
-			"The compaction runs right after the current turn ends. Skipped below the context-usage threshold unless `force` is true.",
+			"The compaction runs right after the current turn ends; with `resume`, work restarts automatically afterwards. " +
+			"Skipped below the context-usage threshold unless `force` is true.",
 		promptSnippet: "auto_compact: compact the context at a logical checkpoint with focused instructions",
 		promptGuidelines: TOOL_GUIDELINES,
 		parameters: {
@@ -224,21 +323,34 @@ export default function autoCompactExtension(pi: ExtensionAPI): void {
 				reason: { type: "string", description: "Why this is a good checkpoint to compact" },
 				instructions: { type: "string", description: "The compaction prompt you wrote: what the next work needs kept verbatim and what can be dropped" },
 				force: { type: "boolean", description: "Compact even below the threshold; use only when the user asked" },
+				resume: {
+					type: "string",
+					description: "Message that restarts your work right after the compaction (e.g. the next step). Omit it when the user asked for the compaction",
+				},
 			},
 			required: ["instructions"],
 		} as any,
 		async execute(_toolCallId: string, params: CompactRequest, _signal: unknown, _onUpdate: unknown, ctx: any) {
+			remember(ctx);
 			// Unlike the event API, instructions do not imply force here: the model almost
 			// always passes instructions, and that must not bypass the threshold.
 			// Deferred: ctx.compact() would abort this very run.
 			const outcome = handle(
-				{ reason: params?.reason, instructions: params?.instructions, force: params?.force === true, source: "tool" },
+				{
+					reason: params?.reason,
+					instructions: params?.instructions,
+					force: params?.force === true,
+					resume: params?.resume,
+					source: "tool",
+				},
 				ctx,
 				true,
 			);
 			const text =
 				outcome.status === "scheduled"
-					? "Compaction scheduled: it runs right after this turn ends. Reply with a short closing message and do no further work."
+					? params?.resume?.trim()
+						? "Compaction scheduled: it runs right after this turn ends, then your `resume` message restarts the work. Reply with a short closing message and do no further work now."
+						: "Compaction scheduled: it runs right after this turn ends. Reply with a short closing message and do no further work."
 					: `Compaction not scheduled: ${outcome.status}${outcome.detail ? ` (${outcome.detail})` : ""}.`;
 			return { content: [{ type: "text", text }], details: { status: outcome.status, detail: outcome.detail } };
 		},

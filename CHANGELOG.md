@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-10-16
+
+### Added
+
+- `resume` on requests (event API and `auto_compact` tool): a message sent to the agent after a successful compaction, starting a new turn so the work continues without the user. Bounded to 3 automatic resumes without user input (`MAX_AUTO_RESUMES`).
+- Requests arriving while the agent is busy are scheduled and run on `agent_settled` instead of aborting the run; a `scheduled` result is emitted.
+- Requests from other extensions use the latest context seen by lifecycle handlers (pi's event bus passes no context).
+- `examples/third-party.ts`: demo extension requesting compactions through the event API.
+
+### Fixed
+
+- "Turn prefix summarization failed: generation hit the token cap" when compacting at a high thinking level: thinking consumed the summary's output budget. The thinking level is now capped (default `low`, `PI_AUTO_COMPACT_THINKING`, `keep` to disable) for the duration of the compaction and restored afterwards.
+
 ## [0.5.0] - 2026-10-12
 
 ### Fixed

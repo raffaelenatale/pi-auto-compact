@@ -16,8 +16,8 @@ pi compacts automatically when the context is close to full, and `/compact` summ
 | `/auto-compact [focus]` | Sends a request to the agent: write a compaction prompt for this focus (default: *continue working on the most recent work*) and run it through the `auto_compact` tool. |
 | `/auto-compact status` | Shows whether the extension is enabled, the threshold and the current context usage. |
 | `auto_compact` tool | The model compacts on its own at a checkpoint — no user command needed. `instructions` (the prompt it wrote) is required; the compaction runs right after the turn ends. |
-| `auto-compact:request` event | Other extensions request a compaction: `{ reason?, instructions?, force? }`. Without `instructions`, pi's native summary prompt is used. |
-| `auto-compact:result` event | Outcomes: `compacted \| skipped \| busy \| error`, with `reason` and `detail`. |
+| `auto-compact:request` event | Other extensions request a compaction: `{ reason?, instructions?, force?, resume? }`. Without `instructions`, pi's native summary prompt is used. With `resume`, that message is sent after a successful compaction and the agent continues without the user (max 3 in a row without user input). |
+| `auto-compact:result` event | Outcomes: `compacted \| scheduled \| skipped \| busy \| error`, with `reason` and `detail`. |
 | `globalThis.__pi_auto_compact_request(payload, ctx)` | Same request, for code that cannot reach the event bus. |
 
 Compaction runs through pi's native `ctx.compact({ customInstructions })`. That call aborts any active agent run, so the `auto_compact` tool never compacts mid-run: it **schedules** the compaction, the agent closes its turn with a short message, and the compaction starts on `agent_settled`, when the agent is idle — like the native `/compact`, with no "operation was aborted" error. The tool's prompt guidelines tell the model this, without any skill.
@@ -27,6 +27,7 @@ Compaction runs through pi's native `ctx.compact({ customInstructions })`. That 
 - **Threshold**: unforced requests are skipped below the context-usage threshold (`PI_AUTO_COMPACT_THRESHOLD`, default `60`%). A forced request or one with explicit `instructions` coming from the event API bypasses it; the `auto_compact` tool bypasses it only with `force: true`, so the model cannot over-compact on its own.
 - **In flight**: while a compaction is scheduled or running, further requests return `busy` without retry.
 - **Disable**: `PI_AUTO_COMPACT=0` (or `false`) skips every request.
+- **Thinking while compacting**: pi gives the summary a small output budget (for the turn prefix, half of `reserveTokens`, 8192 by default) and thinking counts against it, so at high levels the summary is cut off with "generation hit the token cap". While it compacts, the extension caps the thinking level (`PI_AUTO_COMPACT_THINKING`, default `low`; `keep` leaves it alone) and restores the previous level afterwards. A lower level is never raised, and a level you changed in the meantime is not overwritten. This covers compactions started by this extension, not pi's native `/compact` or threshold compaction.
 - **No context**: outside a real pi session the request returns `error` instead of pretending success.
 
 ## Install

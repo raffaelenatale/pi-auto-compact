@@ -1,14 +1,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import autoCompactExtension, { DEFAULT_FOCUS, REQUEST_EVENT, RESULT_EVENT, TOOL_GUIDELINES } from "../src/index.ts";
+import autoCompactExtension, { configFromEnv, thinkingForCompaction, DEFAULT_FOCUS, MAX_AUTO_RESUMES, REQUEST_EVENT, RESULT_EVENT, TOOL_GUIDELINES } from "../src/index.ts";
 
-/** Minimal fake of the pi extension API and of an extension context. */
-function setup(usagePercent: number | null = 80) {
+/**
+ * Minimal fake of the pi extension API and of an extension context. Like pi's
+ * real event bus, `events` handlers receive only the payload, never a context.
+ */
+function setup(usagePercent: number | null = 80, { idle = true, started = true, thinking = "high" as string } = {}) {
+	const levels: string[] = [thinking];
 	const commands: Record<string, any> = {};
 	const tools: Record<string, any> = {};
-	const handlers: Record<string, (data: any, ctx?: any) => any> = {};
+	const handlers: Record<string, (data: any) => any> = {};
 	const piHandlers: Record<string, (event: any, ctx?: any) => any> = {};
 	const sent: Array<[string, any]> = [];
+	const messages: Array<[any, any]> = [];
 	const emitted: Array<[string, any]> = [];
 	const compactions: any[] = [];
 	const notices: string[] = [];
@@ -16,10 +21,13 @@ function setup(usagePercent: number | null = 80) {
 		registerCommand: (name: string, options: any) => (commands[name] = options),
 		registerTool: (tool: any) => (tools[tool.name] = tool),
 		sendUserMessage: (text: string, options: any) => sent.push([text, options]),
+		sendMessage: (message: any, options: any) => messages.push([message, options]),
 		on: (name: string, handler: any) => (piHandlers[name] = handler),
+		getThinkingLevel: () => levels[levels.length - 1],
+		setThinkingLevel: (level: string) => levels.push(level),
 		events: {
 			on: (name: string, handler: any) => (handlers[name] = handler),
-			emit: (name: string, data: any) => emitted.push([name, data]),
+				emit: (name: string, data: any) => emitted.push([name, data]),
 		},
 	};
 	const ctx = {
@@ -27,10 +35,18 @@ function setup(usagePercent: number | null = 80) {
 		ui: { notify: (text: string) => notices.push(text) },
 		getContextUsage: () => (usagePercent === null ? undefined : { percent: usagePercent }),
 		compact: (options: any) => compactions.push(options),
+		idle,
+		isIdle: () => ctx.idle,
 	};
 	autoCompactExtension(pi as any);
-	const settle = () => piHandlers.agent_settled?.({ type: "agent_settled", aborted: false }, ctx);
-	return { commands, tools, handlers, sent, emitted, compactions, notices, ctx, settle };
+	if (started) piHandlers.session_start?.({ type: "session_start" }, ctx);
+	const settle = () => {
+		ctx.idle = true;
+		piHandlers.agent_settled?.({ type: "agent_settled", aborted: false }, ctx);
+	};
+	const request = (data: any) => handlers[REQUEST_EVENT](data);
+	const userInput = (source = "interactive") => piHandlers.input?.({ type: "input", text: "hi", source }, ctx);
+	return { levels, commands, tools, handlers, sent, messages, emitted, compactions, notices, ctx, settle, request, userInput };
 }
 
 test("/auto-compact <focus> asks the agent to write the prompt and call the tool", async () => {
@@ -132,12 +148,122 @@ test("tool: without a pi context it reports an error", async () => {
 
 test("event API: unforced request without instructions follows the threshold", () => {
 	const low = setup(10);
-	low.handlers[REQUEST_EVENT]({ reason: "phase" }, low.ctx);
+	low.request({ reason: "phase" });
 	assert.equal(low.compactions.length, 0);
 	assert.equal(low.emitted.at(-1)![1].status, "skipped");
 
 	const high = setup(90);
-	high.handlers[REQUEST_EVENT]({ reason: "phase" }, high.ctx);
-	assert.equal(high.compactions.length, 1);
+	high.request({ reason: "phase" });
+	assert.equal(high.compactions.length, 1, "the bus carries no context: the last lifecycle context is used");
 	assert.equal(high.compactions[0].customInstructions, undefined, "pi's native summary prompt is used");
+});
+
+test("event API: before any lifecycle context it reports an error instead of throwing", () => {
+	const s = setup(90, { started: false });
+	assert.equal(s.request({ reason: "phase", instructions: "keep it" }).status, "error");
+	assert.equal(s.emitted.at(-1)![1].status, "error");
+});
+
+test("event API: while the agent is busy the request waits for agent_settled", () => {
+	const s = setup(90, { idle: false });
+	assert.equal(s.request({ reason: "phase", instructions: "keep the plan" }).status, "scheduled");
+	assert.deepEqual(s.emitted.at(-1), [RESULT_EVENT, { status: "scheduled", reason: "phase" }]);
+	assert.equal(s.compactions.length, 0, "compacting now would abort the active run");
+	s.settle();
+	assert.equal(s.compactions.length, 1);
+	assert.equal(s.compactions[0].customInstructions, "keep the plan");
+});
+
+test("resume: after compacting, the agent restarts on the resume message", () => {
+	const s = setup(90);
+	s.request({ reason: "phase", instructions: "keep the plan", resume: "Continue with task 4." });
+	assert.equal(s.messages.length, 0, "nothing is sent before the compaction completes");
+	s.compactions[0].onComplete();
+	assert.equal(s.messages.length, 1);
+	const [message, options] = s.messages[0];
+	assert.equal(message.content, "Continue with task 4.");
+	assert.deepEqual(options, { triggerTurn: true });
+	assert.deepEqual(s.emitted.at(-1), [RESULT_EVENT, { status: "compacted", reason: "phase", resumed: true }]);
+});
+
+test("resume: not sent when the compaction fails", () => {
+	const s = setup(90);
+	s.request({ instructions: "a", resume: "go on" });
+	s.compactions[0].onError(new Error("boom"));
+	assert.equal(s.messages.length, 0);
+});
+
+test("resume: the tool passes it through the deferred compaction", async () => {
+	const s = setup(80);
+	await s.tools.auto_compact.execute("id", { instructions: "a", resume: "next step" }, null, null, s.ctx);
+	s.settle();
+	s.compactions[0].onComplete();
+	assert.equal(s.messages[0][0].content, "next step");
+});
+
+test("resume: bounded without user input, re-armed by a user message", () => {
+	const s = setup(90);
+	const cycle = () => {
+		s.request({ instructions: "a", resume: "go on" });
+		s.compactions.at(-1).onComplete();
+	};
+	for (let i = 0; i < MAX_AUTO_RESUMES; i++) cycle();
+	assert.equal(s.messages.length, MAX_AUTO_RESUMES);
+	cycle();
+	assert.equal(s.messages.length, MAX_AUTO_RESUMES, "loop guard");
+	assert.equal(s.emitted.at(-1)![1].resumed, false);
+	assert.match(s.notices.at(-1)!, /resume skipped/);
+	s.userInput("extension");
+	cycle();
+	assert.equal(s.messages.length, MAX_AUTO_RESUMES, "extension input does not re-arm");
+	s.userInput();
+	cycle();
+	assert.equal(s.messages.length, MAX_AUTO_RESUMES + 1);
+});
+
+test("thinkingForCompaction caps only levels above the cap", () => {
+	assert.equal(thinkingForCompaction("high", "low"), "low");
+	assert.equal(thinkingForCompaction("max", "low"), "low");
+	assert.equal(thinkingForCompaction("low", "low"), null);
+	assert.equal(thinkingForCompaction("off", "low"), null);
+	assert.equal(thinkingForCompaction("high", null), null);
+	assert.equal(thinkingForCompaction(undefined, "low"), null);
+});
+
+test("config: PI_AUTO_COMPACT_THINKING sets the cap, 'keep' disables it, junk is ignored", () => {
+	assert.equal(configFromEnv({}).compactThinking, "low");
+	assert.equal(configFromEnv({ PI_AUTO_COMPACT_THINKING: "Medium" }).compactThinking, "medium");
+	assert.equal(configFromEnv({ PI_AUTO_COMPACT_THINKING: "keep" }).compactThinking, null);
+	assert.equal(configFromEnv({ PI_AUTO_COMPACT_THINKING: "bogus" }).compactThinking, "low");
+});
+
+test("compaction lowers the thinking level and restores it on completion", () => {
+	const s = setup(80, { thinking: "high" });
+	s.request({ reason: "r", force: true });
+	assert.equal(s.compactions.length, 1);
+	assert.deepEqual(s.levels, ["high", "low"], "capped while the summary is generated");
+	s.compactions[0].onComplete({});
+	assert.deepEqual(s.levels, ["high", "low", "high"], "restored afterwards");
+});
+
+test("compaction restores the thinking level on error", () => {
+	const s = setup(80, { thinking: "high" });
+	s.request({ reason: "r", force: true });
+	s.compactions[0].onError(new Error("boom"));
+	assert.deepEqual(s.levels, ["high", "low", "high"]);
+});
+
+test("compaction leaves a level that is already low untouched", () => {
+	const s = setup(80, { thinking: "low" });
+	s.request({ reason: "r", force: true });
+	s.compactions[0].onComplete({});
+	assert.deepEqual(s.levels, ["low"]);
+});
+
+test("compaction does not restore over a level the user changed meanwhile", () => {
+	const s = setup(80, { thinking: "high" });
+	s.request({ reason: "r", force: true });
+	s.levels.push("medium");
+	s.compactions[0].onComplete({});
+	assert.deepEqual(s.levels, ["high", "low", "medium"]);
 });
